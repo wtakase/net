@@ -88,6 +88,10 @@ type Transport struct {
 	// plain-text "http" scheme. Note that this does not enable h2c support.
 	AllowHTTP bool
 
+	// MaxFrameSize is the http2 SETTINGS_MAX_FRAME_SIZE to
+	// send in the initial settings frame.
+	MaxFrameSize uint32
+
 	// MaxHeaderListSize is the http2 SETTINGS_MAX_HEADER_LIST_SIZE to
 	// send in the initial settings frame. It is how many bytes
 	// of response headers are allowed. Unlike the http2 spec, zero here
@@ -107,6 +111,11 @@ type Transport struct {
 	// waiting for their turn.
 	StrictMaxConcurrentStreams bool
 
+	// These are used for flow control.
+	TransportDefaultConnFlow uint32
+	TransportDefaultStreamFlow uint32
+	TransportDefaultStreamMinRefresh uint32
+
 	// t1, if non-nil, is the standard library Transport using
 	// this transport. Its settings are used (but not its
 	// RoundTrip method, etc).
@@ -114,6 +123,29 @@ type Transport struct {
 
 	connPoolOnce  sync.Once
 	connPoolOrDef ClientConnPool // non-nil version of ConnPool
+}
+
+// FlowControlTransport is a subset of HTTP/2 Transport which
+// specific for FlowControl.
+type FlowControlTransport struct {
+	// MaxFrameSize is the http2 SETTINGS_MAX_FRAME_SIZE to
+	// send in the initial settings frame.
+	MaxFrameSize uint32
+
+	// These parameters are used for flow control.
+	TransportDefaultConnFlow uint32
+	TransportDefaultStreamFlow uint32
+	TransportDefaultStreamMinRefresh uint32
+}
+
+func (t *Transport) maxFrameSize() uint32 {
+	if t.MaxFrameSize < 16384 {
+		return 16384
+	}
+	if t.MaxFrameSize > 16777215 {
+		return 16777215
+	}
+	return t.MaxFrameSize
 }
 
 func (t *Transport) maxHeaderListSize() uint32 {
@@ -126,22 +158,56 @@ func (t *Transport) maxHeaderListSize() uint32 {
 	return t.MaxHeaderListSize
 }
 
+func (t *Transport) transportDefaultConnFlow() uint32 {
+	if t.TransportDefaultConnFlow == 0 {
+		return transportDefaultConnFlow
+	}
+	if t.TransportDefaultConnFlow > 2147483647 {
+		return 2147483647
+	}
+	return t.TransportDefaultConnFlow
+}
+
+func (t *Transport) transportDefaultStreamFlow() uint32 {
+	if t.TransportDefaultStreamFlow == 0 {
+		return transportDefaultStreamFlow
+	}
+	if t.TransportDefaultStreamFlow > 2147483647 {
+		return 2147483647
+	}
+	return t.TransportDefaultStreamFlow
+}
+
+func (t *Transport) transportDefaultStreamMinRefresh() uint32 {
+	if t.TransportDefaultStreamMinRefresh == 0 {
+		return transportDefaultStreamMinRefresh
+	}
+	if t.TransportDefaultStreamMinRefresh > t.transportDefaultStreamFlow() {
+		return t.transportDefaultStreamFlow()
+	}
+	return t.TransportDefaultStreamMinRefresh
+}
+
 func (t *Transport) disableCompression() bool {
 	return t.DisableCompression || (t.t1 != nil && t.t1.DisableCompression)
 }
 
 // ConfigureTransport configures a net/http HTTP/1 Transport to use HTTP/2.
 // It returns an error if t1 has already been HTTP/2-enabled.
-func ConfigureTransport(t1 *http.Transport) error {
-	_, err := configureTransport(t1)
+func ConfigureTransport(t1 *http.Transport, fct *FlowControlTransport) error {
+	_, err := configureTransport(t1, fct)
 	return err
 }
 
-func configureTransport(t1 *http.Transport) (*Transport, error) {
+func configureTransport(t1 *http.Transport, fct *FlowControlTransport) (*Transport, error) {
 	connPool := new(clientConnPool)
 	t2 := &Transport{
-		ConnPool: noDialClientConnPool{connPool},
-		t1:       t1,
+		ConnPool:                         noDialClientConnPool{connPool},
+		MaxFrameSize:                     fct.MaxFrameSize,
+		TransportDefaultConnFlow:         fct.TransportDefaultConnFlow,
+		TransportDefaultStreamFlow:       fct.TransportDefaultStreamFlow,
+		TransportDefaultStreamMinRefresh: fct.TransportDefaultStreamMinRefresh,
+		t1:                               t1,
 	}
 	connPool.t = t2
 	if err := registerHTTPSProtocol(t1, noDialH2RoundTripper{t2}); err != nil {
@@ -609,7 +675,7 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 		tconn:                 c,
 		readerDone:            make(chan struct{}),
 		nextStreamID:          1,
-		maxFrameSize:          16 << 10,           // spec default
+		maxFrameSize:          t.maxFrameSize(),   // spec default 16384
 		initialWindowSize:     65535,              // spec default
 		maxConcurrentStreams:  1000,               // "infinite", per spec. 1000 seems good enough.
 		peerMaxHeaderListSize: 0xffffffffffffffff, // "infinite", per spec. Use 2^64-1 instead.
@@ -652,7 +718,8 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 
 	initialSettings := []Setting{
 		{ID: SettingEnablePush, Val: 0},
-		{ID: SettingInitialWindowSize, Val: transportDefaultStreamFlow},
+		{ID: SettingInitialWindowSize, Val: t.transportDefaultStreamFlow()},
+		{ID: SettingMaxFrameSize, Val: t.maxFrameSize()},
 	}
 	if max := t.maxHeaderListSize(); max != 0 {
 		initialSettings = append(initialSettings, Setting{ID: SettingMaxHeaderListSize, Val: max})
@@ -660,8 +727,8 @@ func (t *Transport) newClientConn(c net.Conn, singleUse bool) (*ClientConn, erro
 
 	cc.bw.Write(clientPreface)
 	cc.fr.WriteSettings(initialSettings...)
-	cc.fr.WriteWindowUpdate(0, transportDefaultConnFlow)
-	cc.inflow.add(transportDefaultConnFlow + initialWindowSize)
+	cc.fr.WriteWindowUpdate(0, t.transportDefaultConnFlow())
+	cc.inflow.add(int32(t.transportDefaultConnFlow()) + initialWindowSize)
 	cc.bw.Flush()
 	if cc.werr != nil {
 		return nil, cc.werr
@@ -1565,7 +1632,7 @@ func (cc *ClientConn) newStream() *clientStream {
 	}
 	cs.flow.add(int32(cc.initialWindowSize))
 	cs.flow.setConnFlow(&cc.flow)
-	cs.inflow.add(transportDefaultStreamFlow)
+	cs.inflow.add(int32(cc.t.transportDefaultStreamFlow()))
 	cs.inflow.setConnFlow(&cc.inflow)
 	cc.nextStreamID += 2
 	cc.streams[cs.ID] = cs
@@ -1977,8 +2044,8 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 
 	var connAdd, streamAdd int32
 	// Check the conn-level first, before the stream-level.
-	if v := cc.inflow.available(); v < transportDefaultConnFlow/2 {
-		connAdd = transportDefaultConnFlow - v
+	if v := cc.inflow.available(); v < int32(cc.t.transportDefaultConnFlow())/2 {
+		connAdd = int32(cc.t.transportDefaultConnFlow()) - v
 		cc.inflow.add(connAdd)
 	}
 	if err == nil { // No need to refresh if the stream is over or failed.
@@ -1986,8 +2053,8 @@ func (b transportResponseBody) Read(p []byte) (n int, err error) {
 		// consumed by the client) when computing flow control for this
 		// stream.
 		v := int(cs.inflow.available()) + cs.bufPipe.Len()
-		if v < transportDefaultStreamFlow-transportDefaultStreamMinRefresh {
-			streamAdd = int32(transportDefaultStreamFlow - v)
+		if v < int(cc.t.transportDefaultStreamFlow()-cc.t.transportDefaultStreamMinRefresh()) {
+			streamAdd = int32(int(cc.t.transportDefaultStreamFlow()) - v)
 			cs.inflow.add(streamAdd)
 		}
 	}
